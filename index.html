@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dispatch — Advanced</title>
+  <style>
+    :root{--bg:#071021;--panel:#0f1724;--accent:#1fb6ff;--ok:#2dd4bf;--danger:#ff6b6b}
+    html,body{height:100%;margin:0;background:var(--bg);color:#e6eef6;font-family:Inter,Segoe UI,Arial}
+    .wrap{display:flex;gap:12px;padding:12px}
+    canvas{background:linear-gradient(180deg,#07202b,#02101a);border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.6)}
+    .sidebar{width:360px;background:var(--panel);padding:12px;border-radius:8px;overflow:auto}
+    h1{margin:6px 0 12px;font-size:18px}
+    .stat{display:flex;justify-content:space-between;padding:8px;background:rgba(255,255,255,0.02);border-radius:6px;margin-bottom:8px}
+    .building{padding:8px;border-radius:6px;margin-bottom:8px;background:rgba(255,255,255,0.02);cursor:pointer}
+    .btn{display:inline-block;padding:8px 10px;border-radius:6px;background:var(--accent);color:#042;cursor:pointer}
+    .ghost{opacity:0.5}
+    small{color:#9fb0c8}
+    .row{display:flex;gap:8px}
+    .login{display:flex;gap:8px;margin-bottom:8px}
+    .provider{padding:8px;border-radius:6px;background:rgba(255,255,255,0.03);cursor:pointer}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div>
+      <canvas id="game" width="1000" height="640"></canvas>
+    </div>
+    <div class="sidebar">
+      <h1>Dispatch — Advanced</h1>
+      <div class="login">
+        <div class="provider btn" id="signInGoogle">Logga in med Google</div>
+        <div class="provider btn" id="signInGithub">Logga in med GitHub</div>
+        <div class="provider btn" id="signOut">Logga ut</div>
+      </div>
+      <div class="stat"><div>EmergencyPoints</div><div id="ep">0</div></div>
+      <div class="stat"><div>Poäng</div><div id="score">0</div></div>
+      <div class="stat"><div>Tid</div><div id="timer">60</div></div>
+
+      <h3>Byggnader</h3>
+      <div id="buildingsShop"></div>
+      <p><small>Klicka på en byggnadstyp för att köpa — klicka sedan på kartan för att placera. Kostnad dras direkt och byggnaden byggs över tid.</small></p>
+
+      <h3>Stationer</h3>
+      <div id="stationsList"></div>
+
+      <h3>Spara & Synk</h3>
+      <div class="row"><div class="btn" id="saveLocal">Spara lokalt</div><div class="btn" id="loadLocal">Ladda lokalt</div></div>
+      <p><small>Datan sparas i LocalStorage automatiskt. Om du loggar in så synkas den till Firestore (om konfigurerad).</small></p>
+
+      <h3>Instruktioner</h3>
+      <p><small>För att aktivera inloggning/synk: skapa ett Firebase-projekt, aktivera Google och GitHub i Auth, skapa Firestore, och klistra in din firebaseConfig i koden (se README längst ner i filen).</small></p>
+    </div>
+  </div>
+
+<script>
+/* --- CONFIG: Replace with your Firebase config to enable cloud save --- */
+const firebaseConfig = {
+  // apiKey: "YOUR_API_KEY",
+  // authDomain: "your-app.firebaseapp.com",
+  // projectId: "your-app",
+  // storageBucket: "your-app.appspot.com",
+  // messagingSenderId: "...",
+  // appId: "..."
+};
+/* ------------------------------------------------------------------ */
+
+// Minimal feature set: buildings, EmergencyPoints currency, localStorage persistence, optional firebase auth+firestore sync
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// Game state
+let state = {
+  ep: 200, // EmergencyPoints
+  score: 0,
+  timeLeft: 180,
+  level: 1,
+  vehicles: [],
+  incidents: [],
+  stations: [], // built buildings
+  userId: null,
+};
+
+// Building shop
+const SHOP = [
+  {id:'ambulance_station',name:'Ambulansstation',cost:120,buildTime:8,vehicleType:'Ambulans'},
+  {id:'police_station',name:'Polishus',cost:180,buildTime:12,vehicleType:'Polis'},
+  {id:'fire_station',name:'Brandstation',cost:200,buildTime:14,vehicleType:'Brandbil'},
+];
+
+// Load from localStorage if exists
+const LOCAL_KEY = 'dispatch_v2_state_v1';
+
+function saveLocal(){ localStorage.setItem(LOCAL_KEY, JSON.stringify(state)); showToast('Sparat lokalt'); }
+function loadLocal(){ const s = localStorage.getItem(LOCAL_KEY); if(s){ state = JSON.parse(s); showToast('Laddat lokalt'); } else showToast('Ingen lokal data'); }
+
+// Auto-save
+setInterval(()=>{ saveLocal(); if(window.currentUser) syncToCloud(); }, 5000);
+
+// Simple toast
+function showToast(t){ console.log(t); }
+
+// Firebase initialization (optional)
+let firebaseApp=null, auth=null, firestore=null, currentUser=null;
+async function initFirebase(){
+  if(!firebaseConfig || !firebaseConfig.apiKey) return;
+  // load Firebase scripts dynamically
+  await loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js');
+  await loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js');
+  await loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js');
+  firebaseApp = firebase.initializeApp(firebaseConfig);
+  auth = firebaseApp.auth();
+  firestore = firebaseApp.firestore();
+  auth.onAuthStateChanged(async user=>{
+    if(user){ currentUser = user; window.currentUser=user; state.userId=user.uid; await tryLoadCloud(); showToast('Inloggad: '+user.displayName); }
+    else { currentUser=null; window.currentUser=null; state.userId=null; }
+    renderUI();
+  });
+}
+
+function tryLoadCloud(){
+  if(!firestore || !currentUser) return;
+  return firestore.collection('players').doc(currentUser.uid).get().then(doc=>{
+    if(doc.exists){ const d=doc.data(); if(d.state){ state = d.state; showToast('Laddat från cloud'); }
+    }
+  }).catch(e=>console.warn('cloud load',e));
+}
+
+function syncToCloud(){
+  if(!firestore || !currentUser) return;
+  return firestore.collection('players').doc(currentUser.uid).set({state}).catch(e=>console.warn('cloud save',e));
+}
+
+// dynamic script loader
+function loadScript(src){ return new Promise((res,rej)=>{ const s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=rej; document.head.appendChild(s); }); }
+
+// basic map, vehicles, incidents, stations rendering
+
+function makeVehicle(x,y,name){ return {x,y,name,angle:0,speed:120,status:'idle',target:null,id:Math.random().toString(36).slice(2,7)}; }
+
+function reset(){
+  state.ep = 300; state.score=0; state.timeLeft=180; state.level=1; state.vehicles=[]; state.incidents=[]; state.stations=[]; 
+  // default: a small ambulance station so player can dispatch
+  //state.stations.push({type:'ambulance_station',x:120,y:120,built:true,buildProgress:1,id:'starter'});
+  updateSidebar();
+}
+
+function spawnIncident(){
+  const x = 240 + Math.random()*(W-260);
+  const y = 40 + Math.random()*(H-80);
+  const severity = Math.random()<0.4?1:2; // 1 = mild, 2 = severe
+  const ttl = severity===2?30:45;
+  state.incidents.push({x,y,severity,ttl,age:0,id:Math.random().toString(36).slice(2,7),assigned:false});
+}
+
+let lastSpawn=0;
+function update(dt){
+  lastSpawn += dt;
+  const spawnRate = Math.max(1.2, 4 - state.level*0.3);
+  if(lastSpawn > spawnRate){ spawnIncident(); lastSpawn=0; }
+
+  // handle stations build progress
+  state.stations.forEach(s=>{
+    if(!s.built){ s.buildProgress = Math.min(1, s.buildProgress + dt / s.buildTime); if(s.buildProgress>=1){ s.built=true; createVehicleFromStation(s); showToast(s.type+' färdigbyggd'); }}
+  });
+
+  // update vehicles similar to earlier logic
+  state.vehicles.forEach(v=>{
+    if(v.status==='to_incident' && v.target){
+      const t = v.target;
+      const d = dist(v.x,v.y,t.x,t.y);
+      const move = v.speed*dt;
+      if(d <= move){ v.x=t.x; v.y=t.y; v.status='handling'; v.handleTimer= (t.severity===2?6:4); }
+      else{ const ang = Math.atan2(t.y-v.y,t.x-v.x); v.angle=ang; v.x += Math.cos(ang)*move; v.y += Math.sin(ang)*move; }
+    } else if(v.status==='handling'){
+      v.handleTimer -= dt;
+      if(v.handleTimer <=0){
+        const idx = state.incidents.findIndex(i=>i.id===v.target.id);
+        if(idx>=0){ const i = state.incidents[idx]; const bonus = Math.max(0, Math.round(i.ttl)); state.score += i.severity*50 + bonus*5; state.incidents.splice(idx,1); }
+        v.status='returning'; v.target=null; v.returnTarget={x:v.homeX,y:v.homeY};
+      }
+    } else if(v.status==='returning'){
+      const rt = v.returnTarget; const d = dist(v.x,v.y,rt.x,rt.y); const move=v.speed*dt;
+      if(d<=move){ v.x=rt.x; v.y=rt.y; v.status='idle'; v.returnTarget=null; }
+      else{ const ang=Math.atan2(rt.y-v.y,rt.x-v.x); v.angle=ang; v.x+=Math.cos(ang)*move; v.y+=Math.sin(ang)*move; }
+    }
+  });
+
+  for(let i=state.incidents.length-1;i>=0;i--){ const inc=state.incidents[i]; inc.age += dt; inc.ttl -= dt; if(inc.ttl <=0){ state.incidents.splice(i,1); state.score = Math.max(0, state.score - 40*inc.severity); }}
+
+  state.timeLeft -= dt; if(state.timeLeft <=0) state.timeLeft=0;
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#06121a'; ctx.fillRect(0,0,W,H);
+  // grid
+  ctx.strokeStyle='rgba(255,255,255,0.03)'; ctx.lineWidth=1;
+  for(let gx=0;gx<W;gx+=40){ ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke(); }
+  for(let gy=0;gy<H;gy+=40){ ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke(); }
+
+  // stations
+  state.stations.forEach(s=>{
+    ctx.save(); ctx.translate(s.x,s.y);
+    ctx.fillStyle = s.type==='police_station'?'#c7ffd7': s.type==='fire_station'?'#ffd7c7':'#bde4ff';
+    ctx.fillRect(-22,-16,44,32);
+    ctx.fillStyle='#fff'; ctx.font='11px sans-serif'; ctx.fillText(s.name||s.type, -20, -22);
+    if(!s.built){ ctx.fillStyle='rgba(255,255,255,0.8)'; ctx.fillRect(-22,20,44* (s.buildProgress||0),6); ctx.strokeStyle='#fff'; ctx.strokeRect(-22,20,44,6); }
+    ctx.restore();
+  });
+
+  // incidents
+  state.incidents.forEach(inc=>{
+    const ratio = inc.ttl / (inc.severity===2?30:45);
+    const r = 18 + inc.severity*6;
+    ctx.beginPath(); ctx.arc(inc.x,inc.y,r,0,Math.PI*2);
+    const col = inc.severity===2?`rgba(255,80,80,${0.9})`:`rgba(255,200,80,${0.9})`;
+    ctx.fillStyle = col; ctx.fill();
+    ctx.beginPath(); ctx.arc(inc.x,inc.y,r+6,-Math.PI/2, -Math.PI/2 + Math.PI*2*ratio);
+    ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=4; ctx.stroke();
+  });
+
+  // vehicles
+  state.vehicles.forEach(v=>{
+    ctx.save(); ctx.translate(v.x,v.y); ctx.rotate(v.angle);
+    ctx.fillStyle = v.name==='Ambulans'? '#bde4ff': v.name==='Polis'? '#c7ffd7': '#ffd7c7';
+    ctx.fillRect(-12,-8,24,16);
+    ctx.fillStyle='#fff'; ctx.fillRect(-8,-10,16,4);
+    ctx.restore();
+    ctx.fillStyle='#cfe6ff'; ctx.font='12px sans-serif'; ctx.fillText(v.name, v.x+16, v.y-10);
+  });
+
+  // HUD text
+  ctx.fillStyle='#9fb0c8'; ctx.font='14px sans-serif'; ctx.fillText('Dispatch — Advanced',12,18);
+}
+
+// helper
+function dist(x1,y1,x2,y2){return Math.hypot(x1-x2,y1-y2)}
+
+// create vehicle from station when built
+function createVehicleFromStation(station){
+  const v = makeVehicle(station.x + 30, station.y, station.vehicleType);
+  v.homeX = station.x; v.homeY = station.y; state.vehicles.push(v);
+}
+
+// UI: shop render & placement logic
+let placing=null; // building type when placing
+
+function renderShop(){ const shop = document.getElementById('buildingsShop'); shop.innerHTML=''; SHOP.forEach(s=>{
+  const div = document.createElement('div'); div.className='building'; div.innerHTML = `<strong>${s.name}</strong><div><small>Cost: ${s.cost} EP — BuildTime: ${s.buildTime}s</small></div>`;
+  div.onclick = ()=>{ if(state.ep < s.cost) { alert('Inte tillräckligt med EmergencyPoints'); return; } placing = s; showToast('Klicka på kartan för att placera: '+s.name); }
+  shop.appendChild(div);
+}); }
+
+function renderStationsList(){ const el=document.getElementById('stationsList'); el.innerHTML=''; state.stations.forEach(s=>{
+  const d=document.createElement('div'); d.className='building'; d.innerHTML=`<strong>${s.name||s.type}</strong><div><small>${s.built? 'Klar':'Byggs...'} </small></div>`;
+  el.appendChild(d);
+}); }
+
+function updateSidebar(){ document.getElementById('ep').innerText = state.ep; document.getElementById('score').innerText = state.score; document.getElementById('timer').innerText = Math.ceil(state.timeLeft); renderShop(); renderStationsList(); }
+
+// placement
+canvas.addEventListener('click', e=>{
+  const rect = canvas.getBoundingClientRect(); const x = e.clientX-rect.left; const y = e.clientY-rect.top;
+  // if placing building
+  if(placing){
+    // deduct cost now
+    state.ep -= placing.cost; 
+    const station = {type:placing.id,name:placing.name,x,y,built:false,buildProgress:0,buildTime:placing.buildTime,vehicleType:placing.vehicleType,id:Math.random().toString(36).slice(2,7)};
+    state.stations.push(station);
+    placing=null; updateSidebar(); saveLocal(); return;
+  }
+  // otherwise try assign nearest to incidents
+  for(let i=state.incidents.length-1;i>=0;i--){ const inc=state.incidents[i]; if(dist(x,y,inc.x,inc.y) < 30){ assignNearest(inc); return; }}
+});
+
+function assignNearest(inc){
+  let best=null; let bestDist=1e9;
+  state.vehicles.forEach(v=>{ if(v.status==='idle'){ const d = dist(v.x,v.y,inc.x,inc.y); if(d<bestDist){bestDist=d;best=v}}});
+  if(best) assignVehicle(best,inc);
+}
+
+function assignVehicle(v,inc){ v.status='to_incident'; v.target=inc; inc.assigned=true; }
+
+// UI: saving controls
+document.getElementById('saveLocal').addEventListener('click', ()=> saveLocal());
+document.getElementById('loadLocal').addEventListener('click', ()=>{ loadLocal(); updateSidebar(); });
+
+// auth UI (Firebase)
+document.getElementById('signInGoogle').addEventListener('click', async ()=>{
+  if(!window.firebase) return alert('Firebase ej konfigurerat - klistra in firebaseConfig i koden.');
+  const provider = new firebase.auth.GoogleAuthProvider(); firebase.auth().signInWithPopup(provider).catch(e=>alert(e.message));
+});
+document.getElementById('signInGithub').addEventListener('click', async ()=>{
+  if(!window.firebase) return alert('Firebase ej konfigurerat - klistra in firebaseConfig i koden.');
+  const provider = new firebase.auth.GithubAuthProvider(); firebase.auth().signInWithPopup(provider).catch(e=>alert(e.message));
+});
+document.getElementById('signOut').addEventListener('click', async ()=>{ if(window.firebase) firebase.auth().signOut(); });
+
+// attempt to initialize firebase if config present
+initFirebase().then(()=>{ console.log('Firebase init attempted'); }).catch(e=>console.warn(e));
+
+// main loop
+let last = performance.now();
+function loop(ts){ const dt=(ts-last)/1000; last=ts; update(dt); draw(); updateSidebar(); requestAnimationFrame(loop); }
+
+// load saved
+loadLocal(); updateSidebar(); requestAnimationFrame(loop);
+
+// README instructions (not visible on page) - printed to console for convenience
+console.log('
+---- README ----
+1) To enable cloud saves and login, create a Firebase project (https://console.firebase.google.com).
+2) Enable Authentication providers: Google and GitHub. For GitHub, you'll need to register an OAuth app on GitHub to get Client ID/Secret and set OAuth redirect URIs in Firebase.
+3) Enable Firestore in native mode.
+4) Copy the Firebase config object into the firebaseConfig variable at the top of this file.
+5) Host the file (or open locally). When you sign in, your state will sync to Firestore under collection "players" (document = uid).
+---- END README ----
+');
+
+</script>
+</body>
+</html>
